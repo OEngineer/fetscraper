@@ -160,7 +160,7 @@ Environment variables in `.env`:
 | `FETLIFE_PASSWORD` | Your FetLife password | Required |
 | `DOWNLOAD_PATH` | Download directory | `./downloads` |
 | `MAX_WORKERS` | Concurrent downloads | `3` |
-| `RATE_LIMIT_DELAY` | Delay between requests (seconds) | `2.5` |
+| `RATE_LIMIT_DELAY` | Delay between requests (seconds) | `5` |
 | `DEFAULT_MIN_DURATION` | Default minimum duration filter | `0` |
 
 ## Important Notes

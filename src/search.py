@@ -171,6 +171,97 @@ def parse_video_element(element, base_url: str) -> Optional[VideoInfo]:
         return None
 
 
+def iter_search_videos(
+    client: FetLifeClient,
+    query: str,
+    min_duration: int = 0,
+    limit: Optional[int] = None,
+    page: int = 1,
+):
+    """
+    Search for videos on FetLife, yielding each matching video as soon as it's found.
+
+    This lets a caller start acting on early results (e.g. downloading) while later
+    result pages are still being fetched.
+
+    Args:
+        client: Authenticated FetLife client
+        query: Search query string
+        min_duration: Minimum video duration in seconds (0 for no filter)
+        limit: Maximum number of videos to yield (None for all)
+        page: Page number to start from
+
+    Yields:
+        VideoInfo objects as they are found, in page order
+
+    Raises:
+        SearchError: If search fails
+    """
+    if not client.authenticated:
+        raise SearchError("Client must be authenticated to search")
+
+    click.echo(f"Searching for: '{query}'")
+    if min_duration > 0:
+        from .utils import format_duration
+        click.echo(f"Filtering for videos >= {format_duration(min_duration)}")
+
+    yielded = 0
+    current_page = page
+
+    try:
+        while True:
+            # Construct search URL - FetLife uses /search/videos?q=query format
+            search_url = f"{config.base_url}/search/videos?q={query}"
+            if current_page > 1:
+                search_url += f"&page={current_page}"
+
+            click.echo(f"Fetching page {current_page}...")
+            response = client.get(search_url)
+            soup = BeautifulSoup(response.text, "lxml")
+
+            # Search results are rendered as <article id="story_..."> story cards
+            stories = soup.find_all("article", id=re.compile(r"^story_"))
+
+            if not stories:
+                click.echo("No more search results available.")
+                break
+
+            click.echo(f"Found {len(stories)} video stories")
+
+            page_matches = 0
+            for story in stories:
+                video_info = parse_video_element(story, config.base_url)
+                if not video_info:
+                    continue
+
+                # Apply duration filter
+                if min_duration > 0 and video_info.duration < min_duration:
+                    continue
+
+                page_matches += 1
+                yielded += 1
+                yield video_info
+
+                # Check if we've reached the limit
+                if limit and yielded >= limit:
+                    click.echo(f"Reached limit of {limit} videos")
+                    return
+
+            if page_matches:
+                click.echo(f"Found {page_matches} videos on page {current_page} (total: {yielded})")
+            else:
+                click.echo(f"No videos matching criteria on page {current_page} (continuing...)")
+
+            current_page += 1
+
+        click.echo(click.style(f"✓ Search complete: {yielded} videos found", fg="green"))
+
+    except SearchError:
+        raise
+    except Exception as e:
+        raise SearchError(f"Search failed: {e}")
+
+
 def search_videos(
     client: FetLifeClient,
     query: str,
@@ -194,67 +285,4 @@ def search_videos(
     Raises:
         SearchError: If search fails
     """
-    if not client.authenticated:
-        raise SearchError("Client must be authenticated to search")
-
-    click.echo(f"Searching for: '{query}'")
-    if min_duration > 0:
-        from .utils import format_duration
-        click.echo(f"Filtering for videos >= {format_duration(min_duration)}")
-
-    videos = []
-    current_page = page
-
-    try:
-        while True:
-            # Construct search URL - FetLife uses /search/videos?q=query format
-            search_url = f"{config.base_url}/search/videos?q={query}"
-            if current_page > 1:
-                search_url += f"&page={current_page}"
-
-            click.echo(f"Fetching page {current_page}...")
-            response = client.get(search_url)
-            soup = BeautifulSoup(response.text, "lxml")
-
-            # Search results are rendered as <article id="story_..."> story cards
-            stories = soup.find_all("article", id=re.compile(r"^story_"))
-
-            if not stories:
-                click.echo("No more search results available.")
-                break
-
-            click.echo(f"Found {len(stories)} video stories")
-
-            page_videos = []
-            for story in stories:
-                video_info = parse_video_element(story, config.base_url)
-                if not video_info:
-                    continue
-
-                # Apply duration filter
-                if min_duration > 0 and video_info.duration < min_duration:
-                    continue
-
-                page_videos.append(video_info)
-
-                # Check if we've reached the limit
-                if limit and len(videos) + len(page_videos) >= limit:
-                    videos.extend(page_videos[:limit - len(videos)])
-                    click.echo(f"Reached limit of {limit} videos")
-                    return videos
-
-            # Add videos that passed the filter
-            videos.extend(page_videos)
-
-            if page_videos:
-                click.echo(f"Found {len(page_videos)} videos on page {current_page} (total: {len(videos)})")
-            else:
-                click.echo(f"No videos matching criteria on page {current_page} (continuing...)")
-
-            current_page += 1
-
-        click.echo(click.style(f"✓ Search complete: {len(videos)} videos found", fg="green"))
-        return videos
-
-    except Exception as e:
-        raise SearchError(f"Search failed: {e}")
+    return list(iter_search_videos(client, query, min_duration=min_duration, limit=limit, page=page))

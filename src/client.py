@@ -1,5 +1,6 @@
 """HTTP client for FetLife with session management and rate limiting."""
 
+import threading
 import time
 from typing import Optional, Dict, Any
 import requests
@@ -39,16 +40,18 @@ class FetLifeClient:
         self.last_request_time: float = 0
         self.csrf_token: Optional[str] = None
         self.authenticated: bool = False
+        self._rate_limit_lock = threading.Lock()
 
     def _rate_limit(self) -> None:
-        """Enforce rate limiting between requests."""
-        current_time = time.time()
-        time_since_last = current_time - self.last_request_time
+        """Enforce rate limiting between requests (thread-safe for concurrent callers)."""
+        with self._rate_limit_lock:
+            current_time = time.time()
+            time_since_last = current_time - self.last_request_time
 
-        if time_since_last < config.rate_limit_delay:
-            time.sleep(config.rate_limit_delay - time_since_last)
+            if time_since_last < config.rate_limit_delay:
+                time.sleep(config.rate_limit_delay - time_since_last)
 
-        self.last_request_time = time.time()
+            self.last_request_time = time.time()
 
     def get(self, url: str, **kwargs) -> requests.Response:
         """

@@ -1,9 +1,12 @@
 """Video downloader with progress tracking and organization."""
 
+import itertools
 import json
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Dict, Set, Optional
+from typing import Dict, Iterable, List, Set, Optional
 from bs4 import BeautifulSoup
 import click
 from tqdm import tqdm
@@ -34,6 +37,10 @@ class VideoDownloader:
         self.output_dir = output_dir or config.download_path
         self.download_history_file = self.output_dir / ".download_history.json"
         self.downloaded_ids: Set[str] = self._load_download_history()
+        # Guards downloaded_ids + history file writes, and the position counter below,
+        # against concurrent access from multiple download worker threads.
+        self._history_lock = threading.Lock()
+        self._position_counter = itertools.count()
 
     def _load_download_history(self) -> Set[str]:
         """Load history of downloaded video IDs."""
@@ -47,13 +54,13 @@ class VideoDownloader:
         return set()
 
     def _save_download_history(self) -> None:
-        """Save history of downloaded video IDs."""
+        """Save history of downloaded video IDs. Caller must hold self._history_lock."""
         ensure_directory(self.output_dir)
         try:
             with open(self.download_history_file, "w") as f:
                 json.dump({"downloaded_videos": list(self.downloaded_ids)}, f, indent=2)
         except Exception as e:
-            click.echo(f"Warning: Failed to save download history: {e}", err=True)
+            tqdm.write(f"Warning: Failed to save download history: {e}")
 
     def _get_video_download_url(self, video_url: str) -> Optional[str]:
         """
@@ -66,53 +73,68 @@ class VideoDownloader:
             Direct download URL if found, None otherwise
         """
         try:
-            import json
-            import html as html_module
-
             response = self.client.get(video_url)
             soup = BeautifulSoup(response.text, "lxml")
 
-            # FetLife uses Vue components with video data in JSON
-            video_component = soup.find(attrs={"data-component": "VideoStoriesGallery"})
-            if video_component:
-                props_data = video_component.get("data-props", "")
-                if props_data:
-                    try:
-                        props_json = json.loads(html_module.unescape(props_data))
-                        # Navigate through the JSON structure
-                        entries = props_json.get("preload", {}).get("entries", [])
-                        if entries:
-                            videos = entries[0].get("attributes", {}).get("videos", [])
-                            if videos:
-                                # Get the first video's sources
-                                sources = videos[0].get("sources", [])
-                                if sources:
-                                    # Return the HLS stream URL
-                                    return sources[0].get("src")
-                    except json.JSONDecodeError:
-                        pass
+            # The video page embeds its story data (including video sources) as a
+            # <script type="application/json" id="story-data"> block.
+            story_data_elem = soup.find("script", id="story-data", type="application/json")
+            if not story_data_elem or not story_data_elem.string:
+                return None
+
+            try:
+                story_data = json.loads(story_data_elem.string)
+            except json.JSONDecodeError:
+                return None
+
+            videos = story_data.get("attributes", {}).get("videos", [])
+            if not videos:
+                return None
+
+            # Prefer the video whose path matches the requested video ID, in case
+            # the story bundles more than one video.
+            video_id_match = re.search(r"/videos/(\d+)", video_url)
+            video_data = videos[0]
+            if video_id_match:
+                video_id = video_id_match.group(1)
+                for candidate in videos:
+                    if str(candidate.get("id")) == video_id:
+                        video_data = candidate
+                        break
+
+            sources = video_data.get("sources", [])
+            if sources:
+                # Return the HLS master playlist URL (full quality)
+                return sources[0].get("src")
 
             return None
 
         except Exception as e:
-            click.echo(f"Warning: Failed to extract video URL: {e}", err=True)
+            tqdm.write(f"Warning: Failed to extract video URL: {e}")
             return None
 
-    def download_video(self, video_info: VideoInfo, skip_existing: bool = True) -> bool:
+    def download_video(self, video_info: VideoInfo, skip_existing: bool = True, position: Optional[int] = None) -> bool:
         """
         Download a single video.
+
+        Safe to call concurrently from multiple threads (e.g. via
+        `download_videos_as_found`) for different videos.
 
         Args:
             video_info: Video information
             skip_existing: Skip if already downloaded
+            position: Terminal line offset for this download's progress bar, so
+                concurrent downloads don't overwrite each other's line. None lets
+                tqdm pick automatically (fine for single-threaded use).
 
         Returns:
             True if download successful, False otherwise
         """
         # Check if already downloaded
-        if skip_existing and video_info.video_id in self.downloaded_ids:
-            click.echo(f"Skipping {video_info.title} (already downloaded)")
-            return True
+        with self._history_lock:
+            if skip_existing and video_info.video_id in self.downloaded_ids:
+                tqdm.write(f"Skipping {video_info.title} (already downloaded)")
+                return True
 
         # Create user directory
         user_dir = self.output_dir / sanitize_filename(video_info.uploader)
@@ -125,14 +147,15 @@ class VideoDownloader:
 
         # Check if file already exists
         if filepath.exists() and skip_existing:
-            click.echo(f"Skipping {video_info.title} (file exists)")
-            self.downloaded_ids.add(video_info.video_id)
-            self._save_download_history()
+            tqdm.write(f"Skipping {video_info.title} (file exists)")
+            with self._history_lock:
+                self.downloaded_ids.add(video_info.video_id)
+                self._save_download_history()
             return True
 
         try:
             # Get direct download URL
-            click.echo(f"Processing: {video_info.title}")
+            tqdm.write(f"Processing: {video_info.title}")
 
             # Use download_url from search results if available
             download_url = video_info.download_url
@@ -141,20 +164,20 @@ class VideoDownloader:
                 download_url = self._get_video_download_url(video_info.url)
 
             if not download_url:
-                click.echo(click.style(f"✗ Could not find download URL for: {video_info.title}", fg="red"))
+                tqdm.write(click.style(f"✗ Could not find download URL for: {video_info.title}", fg="red"))
                 return False
 
             # Ensure URL is absolute
             if not download_url.startswith("http"):
                 download_url = config.base_url + download_url
 
-            click.echo(f"Downloading to: {filepath}")
+            tqdm.write(f"Downloading to: {filepath}")
 
             # Check if it's an HLS stream (m3u8)
             if ".m3u8" in download_url:
                 # Use ffmpeg to download HLS stream
                 import subprocess
-                click.echo("Downloading HLS stream with ffmpeg...")
+                tqdm.write("Downloading HLS stream with ffmpeg...")
 
                 cmd = [
                     "ffmpeg",
@@ -173,10 +196,10 @@ class VideoDownloader:
                         timeout=600  # 10 minute timeout
                     )
                     if result.returncode != 0:
-                        click.echo(f"ffmpeg error: {result.stderr[:200]}")
+                        tqdm.write(f"ffmpeg error: {result.stderr[:200]}")
                         return False
                 except subprocess.TimeoutExpired:
-                    click.echo("Download timeout (10 minutes)")
+                    tqdm.write("Download timeout (10 minutes)")
                     return False
 
             else:
@@ -187,22 +210,23 @@ class VideoDownloader:
                 total_size = int(response.headers.get("content-length", 0))
 
                 with open(filepath, "wb") as f:
-                    with tqdm(total=total_size, unit="B", unit_scale=True, desc=video_info.title[:30]) as pbar:
+                    with tqdm(total=total_size, unit="B", unit_scale=True, desc=video_info.title[:30], position=position, leave=False) as pbar:
                         for chunk in response.iter_content(chunk_size=8192):
                             if chunk:
                                 f.write(chunk)
                                 pbar.update(len(chunk))
 
             # Mark as downloaded
-            self.downloaded_ids.add(video_info.video_id)
-            self._save_download_history()
+            with self._history_lock:
+                self.downloaded_ids.add(video_info.video_id)
+                self._save_download_history()
 
             file_size = filepath.stat().st_size
-            click.echo(click.style(f"✓ Downloaded: {video_info.title} ({format_file_size(file_size)})", fg="green"))
+            tqdm.write(click.style(f"✓ Downloaded: {video_info.title} ({format_file_size(file_size)})", fg="green"))
             return True
 
         except Exception as e:
-            click.echo(click.style(f"✗ Download failed for {video_info.title}: {e}", fg="red"))
+            tqdm.write(click.style(f"✗ Download failed for {video_info.title}: {e}", fg="red"))
             # Clean up partial download
             if filepath.exists():
                 try:
@@ -244,6 +268,74 @@ class VideoDownloader:
                 stats["success"] += 1
             else:
                 stats["failed"] += 1
+
+        # Print summary
+        click.echo("\n" + "=" * 60)
+        click.echo("Download Summary:")
+        click.echo(f"  Total videos: {stats['total']}")
+        click.echo(click.style(f"  ✓ Successfully downloaded: {stats['success']}", fg="green"))
+        if stats["skipped"] > 0:
+            click.echo(click.style(f"  ⊘ Skipped (already downloaded): {stats['skipped']}", fg="yellow"))
+        if stats["failed"] > 0:
+            click.echo(click.style(f"  ✗ Failed: {stats['failed']}", fg="red"))
+
+        return stats
+
+    def download_videos_as_found(
+        self,
+        videos: Iterable[VideoInfo],
+        skip_existing: bool = True,
+        max_workers: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """
+        Download videos from a (possibly still-growing) iterable as they arrive.
+
+        Unlike `download_videos`, this doesn't require the full list of videos up
+        front: `videos` can be a generator that's still paging through search
+        results. Videos are submitted to a thread pool as soon as they're yielded,
+        so downloading overlaps with fetching later results instead of waiting for
+        every page to finish first.
+
+        Args:
+            videos: Iterable (e.g. a generator) of videos to download
+            skip_existing: Skip already downloaded videos
+            max_workers: Number of concurrent download workers (default: config.max_workers)
+
+        Returns:
+            Dictionary with download statistics
+        """
+        max_workers = max_workers or config.max_workers
+        stats = {"total": 0, "success": 0, "failed": 0, "skipped": 0}
+
+        click.echo(f"\nStarting download (up to {max_workers} at a time) as results are found...")
+        click.echo("=" * 60)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for video in videos:
+                stats["total"] += 1
+
+                if skip_existing and video.video_id in self.downloaded_ids:
+                    tqdm.write(f"⊘ Already downloaded (skipping): {video.title}")
+                    stats["skipped"] += 1
+                    continue
+
+                position = next(self._position_counter) % max_workers
+                future = executor.submit(self.download_video, video, skip_existing, position)
+                futures[future] = video
+
+            for future in as_completed(futures):
+                video = futures[future]
+                try:
+                    success = future.result()
+                except Exception as e:
+                    tqdm.write(click.style(f"✗ Download failed for {video.title}: {e}", fg="red"))
+                    success = False
+
+                if success:
+                    stats["success"] += 1
+                else:
+                    stats["failed"] += 1
 
         # Print summary
         click.echo("\n" + "=" * 60)

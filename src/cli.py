@@ -9,7 +9,7 @@ from colorama import init as colorama_init
 from .client import FetLifeClient
 from .config import config
 from .auth import authenticate, verify_authentication, prompt_credentials, AuthenticationError
-from .search import search_videos, SearchError
+from .search import iter_search_videos, SearchError
 from .profile import get_profile_videos, ProfileError
 from .downloader import VideoDownloader
 from .utils import parse_duration, format_duration
@@ -87,28 +87,32 @@ def search(query, min_duration, limit, output, username, password, no_download, 
             if min_duration > 0:
                 click.echo(f"Minimum duration filter: {format_duration(min_duration)}\n")
 
-            videos = search_videos(client, query, min_duration=min_duration, limit=limit)
-
-            if not videos:
-                click.echo(click.style("No videos found matching criteria.", fg="yellow"))
-                return
-
-            # List videos
-            click.echo(f"\nFound {len(videos)} videos:\n")
-            for idx, video in enumerate(videos, 1):
-                duration_str = format_duration(video.duration) if video.duration else "Unknown"
-                click.echo(f"{idx}. {video.title}")
-                click.echo(f"   Uploader: {video.uploader} | Duration: {duration_str}")
-                click.echo(f"   URL: {video.url}")
+            video_iter = iter_search_videos(client, query, min_duration=min_duration, limit=limit)
 
             if no_download:
+                # No downloading to overlap with, so just drain and list results.
+                videos = list(video_iter)
+                if not videos:
+                    click.echo(click.style("No videos found matching criteria.", fg="yellow"))
+                    return
+
+                click.echo(f"\nFound {len(videos)} videos:\n")
+                for idx, video in enumerate(videos, 1):
+                    duration_str = format_duration(video.duration) if video.duration else "Unknown"
+                    click.echo(f"{idx}. {video.title}")
+                    click.echo(f"   Uploader: {video.uploader} | Duration: {duration_str}")
+                    click.echo(f"   URL: {video.url}")
                 click.echo("\n(Download skipped - list only mode)")
                 return
 
-            # Download videos
+            # Download videos as they're found, overlapping downloads with
+            # fetching later result pages.
             click.echo("\n")
             downloader = VideoDownloader(client, output_dir)
-            downloader.download_videos(videos, skip_existing=not force)
+            stats = downloader.download_videos_as_found(video_iter, skip_existing=not force)
+
+            if stats["total"] == 0:
+                click.echo(click.style("No videos found matching criteria.", fg="yellow"))
 
     except (AuthenticationError, SearchError) as e:
         click.echo(click.style(f"✗ Error: {e}", fg="red"), err=True)

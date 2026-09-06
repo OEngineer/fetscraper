@@ -1,6 +1,7 @@
 """Video downloader with progress tracking and organization."""
 
 import itertools
+import html
 import json
 import re
 import threading
@@ -42,6 +43,32 @@ class VideoDownloader:
         self._history_lock = threading.Lock()
         self._position_counter = itertools.count()
 
+    def _extract_embedded_hls_urls(self, html_text: str) -> List[str]:
+        """Extract signed HLS URLs embedded directly in the video page HTML."""
+        found = []
+        urls: List[str] = []
+        patterns = [
+            r"https?://[^\\\"'<> \n]+?\.m3u8[^\\\"'<> \n]*",
+            r"https?:\\?/\\?/[^\"'<> \n]+?\.m3u8[^\"'<> \n]*",
+        ]
+
+        for pattern in patterns:
+            for match in re.finditer(pattern, html_text):
+                found.append((match.start(), match.group(0)))
+
+        for _, match in sorted(found):
+            url = html.unescape(match).replace("\\/", "/")
+            try:
+                url = url.encode("utf-8").decode("unicode_escape")
+            except UnicodeDecodeError:
+                pass
+
+            if ".m3u8" in url:
+                if url not in urls:
+                    urls.append(url)
+
+        return urls
+
     def _load_download_history(self) -> Set[str]:
         """Load history of downloaded video IDs."""
         if self.download_history_file.exists():
@@ -79,33 +106,34 @@ class VideoDownloader:
             # The video page embeds its story data (including video sources) as a
             # <script type="application/json" id="story-data"> block.
             story_data_elem = soup.find("script", id="story-data", type="application/json")
-            if not story_data_elem or not story_data_elem.string:
-                return None
+            if story_data_elem and story_data_elem.string:
+                try:
+                    story_data = json.loads(story_data_elem.string)
+                except json.JSONDecodeError:
+                    story_data = {}
 
-            try:
-                story_data = json.loads(story_data_elem.string)
-            except json.JSONDecodeError:
-                return None
+                videos = story_data.get("attributes", {}).get("videos", [])
 
-            videos = story_data.get("attributes", {}).get("videos", [])
-            if not videos:
-                return None
+                if videos:
+                    # Prefer the video whose path matches the requested video ID, in case
+                    # the story bundles more than one video.
+                    video_id_match = re.search(r"/videos/(\d+)", video_url)
+                    video_data = videos[0]
+                    if video_id_match:
+                        video_id = video_id_match.group(1)
+                        for candidate in videos:
+                            if str(candidate.get("id")) == video_id:
+                                video_data = candidate
+                                break
 
-            # Prefer the video whose path matches the requested video ID, in case
-            # the story bundles more than one video.
-            video_id_match = re.search(r"/videos/(\d+)", video_url)
-            video_data = videos[0]
-            if video_id_match:
-                video_id = video_id_match.group(1)
-                for candidate in videos:
-                    if str(candidate.get("id")) == video_id:
-                        video_data = candidate
-                        break
+                    sources = video_data.get("sources", [])
+                    if sources:
+                        # Return the HLS master playlist URL (full quality)
+                        return sources[0].get("src")
 
-            sources = video_data.get("sources", [])
-            if sources:
-                # Return the HLS master playlist URL (full quality)
-                return sources[0].get("src")
+            hls_urls = self._extract_embedded_hls_urls(response.text)
+            if hls_urls:
+                return hls_urls[0]
 
             return None
 

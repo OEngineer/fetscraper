@@ -58,7 +58,7 @@ def cli(ctx, test_auth):
 @cli.command()
 @click.argument("query")
 @click.option("--min-duration", "-d", callback=parse_duration_arg, help="Minimum video duration (e.g., 60, 5:30, 5m30s)")
-@click.option("--limit", "-l", type=int, help="Maximum number of videos to download")
+@click.option("--limit", "-l", type=int, help="Maximum new downloads (or listed results with --no-download)")
 @click.option("--output", "-o", type=click.Path(), help="Output directory (default: ./downloads)")
 @click.option("--username", "-u", help="FetLife username (overrides .env)")
 @click.option("--password", "-p", help="FetLife password (overrides .env)")
@@ -87,7 +87,10 @@ def search(query, min_duration, limit, output, username, password, no_download, 
             if min_duration > 0:
                 click.echo(f"Minimum duration filter: {format_duration(min_duration)}\n")
 
-            video_iter = iter_search_videos(client, query, min_duration=min_duration, limit=limit)
+            # In download mode, the downloader owns the limit so existing files
+            # and failed attempts do not consume the new-download quota.
+            search_limit = limit if no_download else None
+            video_iter = iter_search_videos(client, query, min_duration=min_duration, limit=search_limit)
 
             if no_download:
                 # No downloading to overlap with, so just drain and list results.
@@ -109,7 +112,11 @@ def search(query, min_duration, limit, output, username, password, no_download, 
             # fetching later result pages.
             click.echo("\n")
             downloader = VideoDownloader(client, output_dir)
-            stats = downloader.download_videos_as_found(video_iter, skip_existing=not force)
+            stats = downloader.download_videos_as_found(
+                video_iter,
+                skip_existing=not force,
+                limit=limit,
+            )
 
             if stats["total"] == 0:
                 click.echo(click.style("No videos found matching criteria.", fg="yellow"))
@@ -128,7 +135,7 @@ def search(query, min_duration, limit, output, username, password, no_download, 
 @cli.command()
 @click.argument("profile_identifier")
 @click.option("--min-duration", "-d", callback=parse_duration_arg, help="Minimum video duration (e.g., 60, 5:30, 5m30s)")
-@click.option("--limit", "-l", type=int, help="Maximum number of videos to download")
+@click.option("--limit", "-l", type=int, help="Maximum new downloads (or listed results with --no-download)")
 @click.option("--output", "-o", type=click.Path(), help="Output directory (default: ./downloads)")
 @click.option("--username", "-u", help="FetLife username (overrides .env)")
 @click.option("--password", "-p", help="FetLife password (overrides .env)")
@@ -157,7 +164,15 @@ def profile(profile_identifier, min_duration, limit, output, username, password,
             if min_duration > 0:
                 click.echo(f"Minimum duration filter: {format_duration(min_duration)}\n")
 
-            videos = get_profile_videos(client, profile_identifier, min_duration=min_duration, limit=limit)
+            # List-only mode still limits the number shown. Download mode must
+            # inspect later results so existing files do not consume the limit.
+            profile_limit = limit if no_download else None
+            videos = get_profile_videos(
+                client,
+                profile_identifier,
+                min_duration=min_duration,
+                limit=profile_limit,
+            )
 
             if not videos:
                 click.echo(click.style("No videos found matching criteria.", fg="yellow"))
@@ -178,7 +193,7 @@ def profile(profile_identifier, min_duration, limit, output, username, password,
             # Download videos
             click.echo("\n")
             downloader = VideoDownloader(client, output_dir)
-            downloader.download_videos(videos, skip_existing=not force)
+            downloader.download_videos(videos, skip_existing=not force, limit=limit)
 
     except (AuthenticationError, ProfileError) as e:
         click.echo(click.style(f"✗ Error: {e}", fg="red"), err=True)

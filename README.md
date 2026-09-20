@@ -76,7 +76,7 @@ python -m src.cli search "keyword" --min-duration 5:30
 # Search with shorthand format
 python -m src.cli search "keyword" --min-duration 5m30s
 
-# Limit number of results
+# Download up to 10 new videos (existing downloads do not count)
 python -m src.cli search "keyword" --limit 10
 
 # Custom output directory
@@ -99,7 +99,7 @@ python -m src.cli profile 12345
 # With minimum duration filter
 python -m src.cli profile username123 --min-duration 2:00
 
-# Limit number of videos
+# Download up to 5 new videos (existing downloads do not count)
 python -m src.cli profile username123 --limit 5
 
 # Re-download existing videos

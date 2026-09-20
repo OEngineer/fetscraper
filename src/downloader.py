@@ -5,7 +5,7 @@ import html
 import json
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Dict, Iterable, List, Set, Optional
 from bs4 import BeautifulSoup
@@ -141,7 +141,12 @@ class VideoDownloader:
             tqdm.write(f"Warning: Failed to extract video URL: {e}")
             return None
 
-    def download_video(self, video_info: VideoInfo, skip_existing: bool = True, position: Optional[int] = None) -> bool:
+    def download_video(
+        self,
+        video_info: VideoInfo,
+        skip_existing: bool = True,
+        position: Optional[int] = None,
+    ) -> Optional[bool]:
         """
         Download a single video.
 
@@ -156,13 +161,13 @@ class VideoDownloader:
                 tqdm pick automatically (fine for single-threaded use).
 
         Returns:
-            True if download successful, False otherwise
+            True if a new file was downloaded, None if skipped, False if failed
         """
         # Check if already downloaded
         with self._history_lock:
             if skip_existing and video_info.video_id in self.downloaded_ids:
                 tqdm.write(f"Skipping {video_info.title} (already downloaded)")
-                return True
+                return None
 
         # Create user directory
         user_dir = self.output_dir / sanitize_filename(video_info.uploader)
@@ -179,7 +184,7 @@ class VideoDownloader:
             with self._history_lock:
                 self.downloaded_ids.add(video_info.video_id)
                 self._save_download_history()
-            return True
+            return None
 
         try:
             # Get direct download URL
@@ -263,23 +268,36 @@ class VideoDownloader:
                     pass
             return False
 
-    def download_videos(self, videos: List[VideoInfo], skip_existing: bool = True) -> Dict[str, int]:
+    def download_videos(
+        self,
+        videos: List[VideoInfo],
+        skip_existing: bool = True,
+        limit: Optional[int] = None,
+    ) -> Dict[str, int]:
         """
         Download multiple videos.
 
         Args:
             videos: List of videos to download
             skip_existing: Skip already downloaded videos
+            limit: Maximum number of successful new downloads (None for all)
 
         Returns:
             Dictionary with download statistics
         """
-        stats = {"total": len(videos), "success": 0, "failed": 0, "skipped": 0}
+        stats = {"total": 0, "success": 0, "failed": 0, "skipped": 0}
 
-        click.echo(f"\nStarting download of {len(videos)} videos...")
+        if limit:
+            click.echo(f"\nStarting download of up to {limit} new videos...")
+        else:
+            click.echo(f"\nStarting download of {len(videos)} videos...")
         click.echo("=" * 60)
 
         for idx, video in enumerate(videos, 1):
+            if limit and stats["success"] >= limit:
+                break
+
+            stats["total"] += 1
             click.echo(f"\n[{idx}/{len(videos)}] {video.title}")
             click.echo(f"Uploader: {video.uploader}")
             if video.duration:
@@ -291,8 +309,10 @@ class VideoDownloader:
                 stats["skipped"] += 1
                 continue
 
-            success = self.download_video(video, skip_existing=skip_existing)
-            if success:
+            result = self.download_video(video, skip_existing=skip_existing)
+            if result is None:
+                stats["skipped"] += 1
+            elif result:
                 stats["success"] += 1
             else:
                 stats["failed"] += 1
@@ -314,6 +334,7 @@ class VideoDownloader:
         videos: Iterable[VideoInfo],
         skip_existing: bool = True,
         max_workers: Optional[int] = None,
+        limit: Optional[int] = None,
     ) -> Dict[str, int]:
         """
         Download videos from a (possibly still-growing) iterable as they arrive.
@@ -328,6 +349,7 @@ class VideoDownloader:
             videos: Iterable (e.g. a generator) of videos to download
             skip_existing: Skip already downloaded videos
             max_workers: Number of concurrent download workers (default: config.max_workers)
+            limit: Maximum number of successful new downloads (None for all)
 
         Returns:
             Dictionary with download statistics
@@ -338,32 +360,56 @@ class VideoDownloader:
         click.echo(f"\nStarting download (up to {max_workers} at a time) as results are found...")
         click.echo("=" * 60)
 
+        video_iter = iter(videos)
+        source_exhausted = False
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
-            for video in videos:
-                stats["total"] += 1
+            while True:
+                # Keep only enough work in flight to reach the requested number
+                # of successful downloads. A skip or failure opens another slot.
+                while (
+                    not source_exhausted
+                    and len(futures) < max_workers
+                    and (not limit or stats["success"] + len(futures) < limit)
+                ):
+                    try:
+                        video = next(video_iter)
+                    except StopIteration:
+                        source_exhausted = True
+                        break
 
-                if skip_existing and video.video_id in self.downloaded_ids:
-                    tqdm.write(f"⊘ Already downloaded (skipping): {video.title}")
-                    stats["skipped"] += 1
-                    continue
+                    stats["total"] += 1
+                    with self._history_lock:
+                        already_downloaded = video.video_id in self.downloaded_ids
 
-                position = next(self._position_counter) % max_workers
-                future = executor.submit(self.download_video, video, skip_existing, position)
-                futures[future] = video
+                    if skip_existing and already_downloaded:
+                        tqdm.write(f"⊘ Already downloaded (skipping): {video.title}")
+                        stats["skipped"] += 1
+                        continue
 
-            for future in as_completed(futures):
-                video = futures[future]
-                try:
-                    success = future.result()
-                except Exception as e:
-                    tqdm.write(click.style(f"✗ Download failed for {video.title}: {e}", fg="red"))
-                    success = False
+                    position = next(self._position_counter) % max_workers
+                    future = executor.submit(self.download_video, video, skip_existing, position)
+                    futures[future] = video
 
-                if success:
-                    stats["success"] += 1
-                else:
-                    stats["failed"] += 1
+                if not futures:
+                    break
+
+                completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    video = futures.pop(future)
+                    try:
+                        result = future.result()
+                    except Exception as e:
+                        tqdm.write(click.style(f"✗ Download failed for {video.title}: {e}", fg="red"))
+                        result = False
+
+                    if result is None:
+                        stats["skipped"] += 1
+                    elif result:
+                        stats["success"] += 1
+                    else:
+                        stats["failed"] += 1
 
         # Print summary
         click.echo("\n" + "=" * 60)

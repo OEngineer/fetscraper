@@ -79,6 +79,9 @@ python -m src.cli search "keyword" --min-duration 5m30s
 # Download up to 10 new videos (existing downloads do not count)
 python -m src.cli search "keyword" --limit 10
 
+# Exclude uploader profiles (repeat --exclude for each profile)
+python -m src.cli search "keyword" --exclude profile1 --exclude profile2
+
 # Custom output directory
 python -m src.cli search "keyword" --output /path/to/downloads
 

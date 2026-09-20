@@ -1,7 +1,7 @@
 """Search functionality for finding videos on FetLife."""
 
 import re
-from typing import List, Dict, Optional
+from typing import Iterable, List, Dict, Optional
 from dataclasses import dataclass
 from bs4 import BeautifulSoup
 import click
@@ -28,6 +28,11 @@ class VideoInfo:
 class SearchError(Exception):
     """Raised when search fails."""
     pass
+
+
+def _normalize_profile_name(name: str) -> str:
+    """Normalize a profile name for case-insensitive exact matching."""
+    return name.strip().lstrip("@").casefold()
 
 
 def fetch_video_duration(client: FetLifeClient, video_url: str) -> int:
@@ -177,6 +182,7 @@ def iter_search_videos(
     min_duration: int = 0,
     limit: Optional[int] = None,
     page: int = 1,
+    excluded_profiles: Optional[Iterable[str]] = None,
 ):
     """
     Search for videos on FetLife, yielding each matching video as soon as it's found.
@@ -190,6 +196,7 @@ def iter_search_videos(
         min_duration: Minimum video duration in seconds (0 for no filter)
         limit: Maximum number of videos to yield (None for all)
         page: Page number to start from
+        excluded_profiles: Uploader profile names to exclude (case-insensitive)
 
     Yields:
         VideoInfo objects as they are found, in page order
@@ -204,6 +211,14 @@ def iter_search_videos(
     if min_duration > 0:
         from .utils import format_duration
         click.echo(f"Filtering for videos >= {format_duration(min_duration)}")
+
+    excluded_names = {
+        normalized
+        for name in excluded_profiles or ()
+        if (normalized := _normalize_profile_name(name))
+    }
+    if excluded_names:
+        click.echo(f"Excluding {len(excluded_names)} profile(s)")
 
     yielded = 0
     current_page = page
@@ -232,6 +247,9 @@ def iter_search_videos(
             for story in stories:
                 video_info = parse_video_element(story, config.base_url)
                 if not video_info:
+                    continue
+
+                if _normalize_profile_name(video_info.uploader) in excluded_names:
                     continue
 
                 # Apply duration filter
@@ -268,6 +286,7 @@ def search_videos(
     min_duration: int = 0,
     limit: Optional[int] = None,
     page: int = 1,
+    excluded_profiles: Optional[Iterable[str]] = None,
 ) -> List[VideoInfo]:
     """
     Search for videos on FetLife.
@@ -278,6 +297,7 @@ def search_videos(
         min_duration: Minimum video duration in seconds (0 for no filter)
         limit: Maximum number of videos to return (None for all)
         page: Page number to start from
+        excluded_profiles: Uploader profile names to exclude (case-insensitive)
 
     Returns:
         List of VideoInfo objects
@@ -285,4 +305,13 @@ def search_videos(
     Raises:
         SearchError: If search fails
     """
-    return list(iter_search_videos(client, query, min_duration=min_duration, limit=limit, page=page))
+    return list(
+        iter_search_videos(
+            client,
+            query,
+            min_duration=min_duration,
+            limit=limit,
+            page=page,
+            excluded_profiles=excluded_profiles,
+        )
+    )

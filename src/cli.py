@@ -59,12 +59,19 @@ def cli(ctx, test_auth):
 @click.argument("query")
 @click.option("--min-duration", "-d", callback=parse_duration_arg, help="Minimum video duration (e.g., 60, 5:30, 5m30s)")
 @click.option("--limit", "-l", type=int, help="Maximum new downloads (or listed results with --no-download)")
+@click.option(
+    "--exclude",
+    "excluded_profiles",
+    multiple=True,
+    metavar="PROFILE",
+    help="Exclude an uploader profile (repeat for multiple profiles)",
+)
 @click.option("--output", "-o", type=click.Path(), help="Output directory (default: ./downloads)")
 @click.option("--username", "-u", help="FetLife username (overrides .env)")
 @click.option("--password", "-p", help="FetLife password (overrides .env)")
 @click.option("--no-download", is_flag=True, help="List videos without downloading")
 @click.option("--force", "-f", is_flag=True, help="Re-download existing videos")
-def search(query, min_duration, limit, output, username, password, no_download, force):
+def search(query, min_duration, limit, excluded_profiles, output, username, password, no_download, force):
     """Search for videos by keyword and download them."""
     try:
         # Setup output directory
@@ -90,7 +97,13 @@ def search(query, min_duration, limit, output, username, password, no_download, 
             # In download mode, the downloader owns the limit so existing files
             # and failed attempts do not consume the new-download quota.
             search_limit = limit if no_download else None
-            video_iter = iter_search_videos(client, query, min_duration=min_duration, limit=search_limit)
+            video_iter = iter_search_videos(
+                client,
+                query,
+                min_duration=min_duration,
+                limit=search_limit,
+                excluded_profiles=excluded_profiles,
+            )
 
             if no_download:
                 # No downloading to overlap with, so just drain and list results.
